@@ -14,11 +14,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from utils import (
+    append_jsonl,
     logger,
     make_bibtex_key,
     normalize_author,
+    paper_id_hash,
     rate_limited_request,
     title_similarity,
+    utc_now_iso,
 )
 
 SEMANTIC_SCHOLAR_URL = "https://api.semanticscholar.org/graph/v1/paper/search"
@@ -272,8 +275,14 @@ def search_papers(
     limit: int = 15,
     fields: list | None = None,
     include_preprint: bool = False,
+    log_path: str | None = "evidence_log.jsonl",
 ) -> list[dict]:
-    """主入口：并行三源检索 → 合并去重 → 按引用量降序返回。"""
+    """主入口：并行三源检索 → 合并去重 → 按引用量降序返回。
+
+    Writes one JSONL record per merged result to `log_path` so the downstream
+    audit can prove each paper came from a real API response.
+    Pass log_path=None or "" to disable logging (for unit tests).
+    """
     per_api = max(limit, int(math.ceil(limit * 3)))
     logger.info(f"Searching '{query}' (limit={limit}, per_api={per_api}, years={year_range})")
 
@@ -296,6 +305,27 @@ def search_papers(
     if not include_preprint:
         merged = [p for p in merged if not PREPRINT_VENUE_RE.search(p.get("venue") or "")]
     logger.info(f"After merge/dedupe: {len(merged)} unique papers")
+
+    if log_path:
+        ts = utc_now_iso()
+        for p in merged:
+            append_jsonl(
+                log_path,
+                {
+                    "timestamp": ts,
+                    "event": "search_result",
+                    "paper_id": paper_id_hash(p),
+                    "query": query,
+                    "title": p.get("title"),
+                    "doi": p.get("doi"),
+                    "year": p.get("year"),
+                    "venue": p.get("venue"),
+                    "first_author": (p.get("authors") or [""])[0],
+                    "citation_count": p.get("citation_count"),
+                    "source_apis": p.get("source_apis"),
+                },
+            )
+        logger.info(f"Wrote {len(merged)} search-result records to {log_path}")
     return merged
 
 
@@ -307,9 +337,14 @@ def _cli() -> int:
     p.add_argument("--limit", type=int, default=10)
     p.add_argument("--include-preprint", action="store_true")
     p.add_argument("--json", action="store_true", help="output JSON")
+    p.add_argument("--log", default="evidence_log.jsonl", help="evidence log path; '' disables")
     args = p.parse_args()
     papers = search_papers(
-        args.query, (args.from_year, args.to_year), args.limit, include_preprint=args.include_preprint
+        args.query,
+        (args.from_year, args.to_year),
+        args.limit,
+        include_preprint=args.include_preprint,
+        log_path=args.log or None,
     )
     if args.json:
         json.dump(papers[: args.limit], sys.stdout, ensure_ascii=False, indent=2)

@@ -12,11 +12,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from utils import (
+    append_jsonl,
     first_author_last_name,
     logger,
     normalize_author,
+    paper_id_hash,
     rate_limited_request,
     title_similarity,
+    utc_now_iso,
 )
 
 CROSSREF_WORK_URL = "https://api.crossref.org/works/{doi}"
@@ -164,10 +167,18 @@ def verify_paper(paper: dict) -> dict:
     return out
 
 
-def batch_verify(papers: list[dict], max_workers: int = 4) -> list[dict]:
+def batch_verify(
+    papers: list[dict],
+    max_workers: int = 4,
+    log_path: str | None = "verification_log.jsonl",
+) -> list[dict]:
     """
     并行批量验证。
     自动丢弃 UNVERIFIED 的文献，只返回 VERIFIED 和 LIKELY_REAL。
+
+    Writes one JSONL record per verification attempt (including UNVERIFIED ones)
+    to `log_path`. The audit script reads this log to detect fabricated entries
+    in the final bibliography. Pass log_path=None or "" to disable.
     """
     logger.info(f"Verifying {len(papers)} candidate papers (max_workers={max_workers})")
     results: list[dict] = []
@@ -179,6 +190,26 @@ def batch_verify(papers: list[dict], max_workers: int = 4) -> list[dict]:
                 results.append(r)
             except Exception as e:
                 logger.warning(f"verify failed for one paper: {e}")
+
+    if log_path:
+        ts = utc_now_iso()
+        for r in results:
+            append_jsonl(
+                log_path,
+                {
+                    "timestamp": ts,
+                    "event": "verification",
+                    "paper_id": paper_id_hash(r),
+                    "title_claimed": r.get("title"),
+                    "doi_claimed": r.get("doi"),
+                    "year_claimed": r.get("year"),
+                    "first_author_claimed": (r.get("authors") or [""])[0],
+                    "verdict": r.get("verification_status"),
+                    "details": r.get("verification_details", {}),
+                },
+            )
+        logger.info(f"Wrote {len(results)} verification records to {log_path}")
+
     kept = [p for p in results if p.get("verification_status") in {"VERIFIED", "LIKELY_REAL"}]
     dropped = len(results) - len(kept)
     logger.info(
@@ -206,12 +237,26 @@ def _cli() -> int:
 
     p_json = sub.add_parser("paper", help="verify a paper JSON from stdin")
 
+    p_batch = sub.add_parser("batch", help="verify a JSON array of papers from a file")
+    p_batch.add_argument("papers_json")
+    p_batch.add_argument("--log", default="verification_log.jsonl")
+    p_batch.add_argument("--no-log", action="store_true")
+    p_batch.add_argument("--max-workers", type=int, default=4)
+
     args = p.parse_args()
 
     if args.cmd == "doi":
         r = verify_by_doi(args.doi, args.title, args.year, args.author)
     elif args.cmd == "title":
         r = verify_by_cross_check(args.title, args.year, args.author)
+    elif args.cmd == "batch":
+        with open(args.papers_json, encoding="utf-8") as f:
+            papers = json.load(f)
+        log = None if args.no_log else args.log
+        kept = batch_verify(papers, max_workers=args.max_workers, log_path=log)
+        json.dump(kept, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+        return 0
     else:
         paper = json.load(sys.stdin)
         r = verify_paper(paper)

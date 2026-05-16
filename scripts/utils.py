@@ -4,9 +4,14 @@ SciPilot-cite :: utils.py
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import os
 import re
+import threading
 import time
+from datetime import datetime, timezone
 from typing import Any, Iterable
 from urllib.parse import urlparse
 
@@ -28,6 +33,7 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 _LAST_REQUEST_TIME: dict[str, float] = {}
+_LOG_LOCK = threading.Lock()
 
 _STOPWORDS = set(
     """a an the and or but is are was were be been being have has had do does did
@@ -202,6 +208,42 @@ def author_initials_first(name: str) -> str:
     last = parts[-1]
     given = " ".join(parts[:-1])
     return f"{initials(given)} {last}"
+
+
+def utc_now_iso() -> str:
+    """ISO 8601 timestamp in UTC with Z suffix."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def paper_id_hash(paper: dict) -> str:
+    """
+    Stable 16-char hex id from DOI (preferred) or (normalized_title|year|first_author_last).
+    Used to bind a paper across search → verify → audit stages.
+    """
+    doi = (paper.get("doi") or "").lower().strip()
+    if doi:
+        seed = f"doi:{doi}"
+    else:
+        raw_title = (paper.get("title") or "").lower()
+        norm_title = re.sub(r"[^\w\s]", " ", raw_title)
+        norm_title = re.sub(r"\s+", " ", norm_title).strip()
+        year = str(paper.get("year") or "")
+        first_last = first_author_last_name(paper.get("authors") or []).lower()
+        seed = f"title:{norm_title}|year:{year}|author:{first_last}"
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+
+
+def append_jsonl(path: str, record: dict) -> None:
+    """Thread-safe append of one JSON record to a JSONL file."""
+    if not path:
+        return
+    line = json.dumps(record, ensure_ascii=False, sort_keys=True)
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent and not os.path.exists(parent):
+        os.makedirs(parent, exist_ok=True)
+    with _LOG_LOCK:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
 
 
 def author_last_initials(name: str) -> str:

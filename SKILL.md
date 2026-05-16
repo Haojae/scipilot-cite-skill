@@ -31,6 +31,7 @@ SciPilot-cite 将真实、可验证的学术文献自动检索并插入用户论
 4. **质量铁律**：优先选择高引用量、发表在知名期刊/会议的文献。预印本（arXiv 等）仅在用户明确允许时才包含。
 5. **格式一致铁律**：同一篇论文中所有引用必须使用完全相同的格式规范，不允许混用不同引用风格。
 6. **不破坏铁律**：插入引用时不得修改论文的任何原有内容（文字、图表、公式等），只允许在合适位置添加引用标记和 References 章节。
+7. **证据账本铁律**：最终 bibliography 中的**每一篇**文献都必须在工作目录的 `verification_log.jsonl` 中有对应 `paper_id` 条目，且 `verdict ∈ {VERIFIED, LIKELY_REAL}`。Stage 7 必须运行 `scripts/audit_no_hallucination.py` 做末端 100% 重验证 + 与日志对账，**只有 audit 返回 PASS 才能交付**；任何 FAIL 必须中断、向用户报告疑似幻觉条目，不得"凭印象"添加任何未经脚本验证的论文。
 
 ## 触发条件
 
@@ -139,15 +140,36 @@ GB/T [1] 作者. 题名[J]. 刊名, 年, 卷(期): 起止页码.
 
 ### Stage 7：最终检查与交付
 
-执行以下自动检查（务必全部通过）：
+#### 第 0 项（阻塞性幻觉门控 — Gate 8）
+
+**这是第一项，先于其他自检执行，失败立即中断整个交付流程。**
+
+把最终采用的文献清单写到 `final_papers.json`，然后强制运行：
+
+```bash
+python scripts/audit_no_hallucination.py final_papers.json \
+       --log verification_log.jsonl \
+       --report audit_report.json
+```
+
+捕获 exit code：
+- `0` → audit PASS，所有引用通过 100% 重验证 + 日志对账，继续后续自检
+- `2` → audit FAIL，立刻中断 Stage 7。读 `audit_report.json` 的 `per_paper` 段，把所有 `pass=false` 的条目逐条向用户报告（标题、DOI、失败原因），询问用户是要丢弃这些条目（推荐）、用替代论文重检（回 Stage 2）、还是放弃整次操作
+- `3` → 运行性错误（文件缺失/格式错误），修复后重跑
+
+**绝对不允许**：跳过 audit、伪造 audit 报告、把 FAIL 条目当 PASS 处理。这条违反了 IRON RULE 7。
+
+#### 第 1-5 项（仅在第 0 项 PASS 后执行）
+
 1. **编号连续性**：正文 [1] 到 [N] 无跳跃、无重复
 2. **引用-列表一致性**：每个正文编号在 References 都有；References 无未引用孤儿
 3. **格式一致性**：所有条目同一 style
-4. **真实性复核**：随机抽 20% 文献重新 DOI 验证
-5. **原文完整性**：diff 比对确认未修改原文
+4. **原文完整性**：diff 比对确认未修改原文
+5. **预印本占比**：若 `include_preprint=False`，复查 venue 不含 arxiv
 
 交付时输出一份 **SciPilot 引用报告**：
 - 总计添加 N 篇
+- audit_report.json 的 PASS/FAIL 摘要
 - 各文献的验证状态、来源 API
 - 各章节引用分布
 - 任何 LIKELY_REAL 文献必须明确标注
@@ -170,6 +192,17 @@ GB/T [1] 作者. 题名[J]. 刊名, 年, 卷(期): 起止页码.
 pip install requests python-docx python-Levenshtein
 ```
 所有 API 都是免费访问层级，无需 API key。
+
+## 工作目录产物（必须保留至交付完成）
+
+| 文件 | 由谁生成 | 用途 |
+|---|---|---|
+| `evidence_log.jsonl` | `search_papers.py` 每条结果落盘 | 证明每篇候选都来自真实 API 响应 |
+| `verification_log.jsonl` | `verify_paper.py::batch_verify` 每条验证落盘 | Stage 7 第 0 项的对账依据 |
+| `final_papers.json` | LLM 在 Stage 4 用户确认后写出 | audit 的输入 |
+| `audit_report.json` | `audit_no_hallucination.py` 输出 | 给用户的 Gate 8 凭证 |
+
+**这四个文件构成本 Skill 的"证据链"**。LLM 没有写权限直接产生 evidence/verification 日志——必须通过运行对应的 Python 脚本来产生。这是把"不编造"从口号变成机器可检查契约的核心机制。
 
 ## 参考文件
 

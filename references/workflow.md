@@ -189,15 +189,43 @@ SciPilot 候选清单（已验证）：
 
 ## Stage 7：最终检查
 
-### 7 项自检
+### 第 0 项：阻塞性幻觉门控（Gate 8）
+
+**先于所有其他自检执行；audit 不通过则立刻中断整个交付流程。**
+
+把最终采用的文献列表序列化到 `final_papers.json`（结构为 `list[dict]` 或 `{"papers": [...]}`），然后运行：
+
+```bash
+python scripts/audit_no_hallucination.py final_papers.json \
+       --log verification_log.jsonl \
+       --report audit_report.json
+```
+
+audit 行为：
+1. 加载 `verification_log.jsonl`，按 `paper_id` 建索引
+2. 对 `final_papers.json` 中每篇文献：
+   - 计算 `paper_id_hash`，到日志中查 verdict
+   - **独立地**重新调用 `verify_paper()` 做实时验证（100% 抽样，不是 20%）
+   - 三项必须同时满足：日志中存在 + 日志 verdict 是 VERIFIED/LIKELY_REAL + 实时 verdict 也是 VERIFIED/LIKELY_REAL
+3. 检测 verdict drift（日志说 VERIFIED 但实时说 UNVERIFIED → 可能是 API 缓存污染或元数据漂移）
+
+exit code 含义：
+- `0` PASS：每篇都通过对账+实时复核，**才能**继续 Stage 7 后续 5 项自检
+- `2` FAIL：至少一篇可疑。读 `audit_report.json` 的 `per_paper` 字段，向用户报告每条 `pass=false` 的：标题、DOI、`log_verdict`、`live_verdict`、`reasons`。然后请用户决定：
+  - 丢弃这些条目（推荐——最安全，保留通过 audit 的条目继续交付）
+  - 用替代关键词重检（回 Stage 2）
+  - 放弃整次操作
+- `3` 运行性错误（输入文件不存在/JSON 损坏）→ 修复后重跑
+
+### 第 1-5 项（第 0 项 PASS 后才执行）
 
 1. **编号连续性**：`{1, 2, ..., N}` 完整无跳跃
 2. **正文→列表存在性**：每个 `[N]` 都有对应条目
 3. **列表→正文存在性**：每个条目都被正文引用（无孤儿）
 4. **格式一致性**：所有条目使用同一 style
-5. **真实性复核**：随机抽 20%（最少 3 篇）重新调 Crossref 验证
-6. **原文完整性**：diff 比对，确认原文段落无意外修改
-7. **预印本占比**：若 `include_preprint=False`，复查 venue 不含 arxiv
+5. **原文完整性**：diff 比对，确认原文段落无意外修改
+
+第 1-5 项是结构性检查，已被前序流程基本保证。第 0 项是核心防御。
 
 ### 输出报告
 
@@ -208,6 +236,12 @@ SciPilot 候选清单（已验证）：
 - 添加文献：15 篇
 - 引用格式：IEEE
 - 验证：VERIFIED 13 篇 / LIKELY_REAL 2 篇 / UNVERIFIED 0
+
+## Gate 8 审计
+- audit_report.json: PASS
+- 重验证: 15/15 实时通过 Crossref/S2/OpenAlex
+- 日志对账: 15/15 在 verification_log.jsonl 中有对应条目
+- 漂移检测: 0 篇 verdict drift
 
 ## 章节分布
 - Introduction: 3
@@ -220,11 +254,11 @@ SciPilot 候选清单（已验证）：
 - openalex: 14
 - crossref: 15（DOI 验证全部通过）
 
-## [WARN] LIKELY_REAL 警告
+## LIKELY_REAL 警告
 - [7] Smith et al. (2024) — DOI 缺失，但 S2+OpenAlex 跨源验证通过
 
-## 自检
-所有 7 项检查通过 [OK]
+## 结构自检
+1-5 项全部通过
 ```
 
 ---
@@ -255,6 +289,14 @@ SciPilot 候选清单（已验证）：
 ### 6. 论文格式异常（损坏的 .docx 或语法错误的 .tex）
 - 解析失败时立即终止
 - 输出具体错误位置和修复建议
+
+### 7. Gate 8 审计 FAIL（疑似幻觉条目被拦截）
+- 这是新增的物理门控触发场景，几种典型情况：
+  - **缺日志条目**：某篇文献在 `final_papers.json` 里但 `verification_log.jsonl` 找不到对应 `paper_id` → 说明该文献从未经过 Stage 3，可能是 LLM 凭印象添加的，必须丢弃
+  - **verdict drift**：日志记录 VERIFIED 但实时复核 UNVERIFIED → 可能 Crossref 元数据更新、API 缓存污染、或日志被篡改；保守处理是丢弃该条
+  - **DOI 解析失效**：日志中曾 VERIFIED，现 Crossref 返回 404 → 文献可能下架；建议保留但在报告中标注
+- 处置原则：**永不"放过"FAIL 条目**。即使用户施压，也必须从 bibliography 中移除或重新跑 Stage 2 找替代论文
+- 用户可选：(a) 丢弃 FAIL 条目继续交付剩余 PASS 条目 (b) 回 Stage 2 用补充关键词重检 (c) 用户提供精确 DOI 强制重新验证 (d) 终止整次操作
 
 ---
 
